@@ -41,7 +41,7 @@ def plot_compact(model, trace, new_cases_obs, date_data_begin, diff_data_sim=16,
 
     num_days_data = len(new_cases_obs)
     diff_to_0 = num_days_data + diff_data_sim
-    date_data_end = date_begin_sim + datetime.timedelta(days=diff_data_sim + num_days_data)
+    date_end = date_begin_sim + datetime.timedelta(days=diff_data_sim + num_days_data)
     num_days_future = (end_date_plot - date_data_end).days
     start_date_mpl, end_date_mpl = matplotlib.dates.date2num([start_date_plot, end_date_plot])
     week_inter_left = int(np.ceil(num_days_data/7/5))
@@ -130,50 +130,65 @@ def plot_compact(model, trace, new_cases_obs, date_data_begin, diff_data_sim=16,
         fig.savefig(savefig + '.png', dpi=300)
 
 def analyze_country(
-        country,
-        date_data_begin,
-        date_data_end,
-        N,
         mobility_type = 'transit_stations',
         mobility_source = 'google',
         lambda_0 = 0.4,
         lambda_min=0.1,
-        num_days_forecast = 10,
+        fcast_len = 5,
         diff_data_sim=16
         ):
-    #Parses strings
-    date_data_begin = datetime.datetime.fromisoformat(date_data_begin)
-    date_data_end = datetime.datetime.fromisoformat(date_data_end)
 
-    #Gets data
+    #Parameters
+    country ='Germany'
+    N = 83e6
+    date_begin = datetime.datetime.fromisoformat('2020-03-01')
+    date_end = datetime.datetime.fromisoformat('2020-04-15')
+
+    #Gets case data
     data = cov19.data_retrieval.JHU()
     data.download_confirmed()
-    new_cases = data.get_confirmed('Germany').diff()[date_data_begin:date_data_end]
+    new_cases = data.get_confirmed('Germany').diff()[date_begin:date_end]
     new_cases = new_cases.values.flatten()
 
-    country_report = parse_names(country, mobility_source)
-    if mobility_source == 'apple':
-        mobility = get_mobility_reports_apple(country_report,[mobility_type])
-    elif mobility_source == 'google':
-        mobility = get_mobility_reports_google(country_report,[mobility_type])
-    else:
-        ValueError('Invalid mobility_source')
+
+    #Gets mobility data
+    mobility = cov19.data_retrieval.GOOGLE(True).get_changes('Germany')['transit_stations_percent_change_from_baseline']/100
+
+    #Full date range
+    date_0 = date_begin - datetime.timedelta(days=diff_data_sim)
+    date_1 = date_end + datetime.timedelta(days=fcast_len)
+
+    #Mobility date range
+    date_mob_0 = mobility.index.min()
+    date_mob_1 = mobility.index.max()
+
+    #Pads mobility ts
+    if date_0 < date_mob_0:
+        mobility = mobility.append(pd.Series(0, index=pd.date_range(date_0, date_mob_0, closed='left')))
+    if date_1 > date_mob_1:
+        mobility = mobility.append(pd.Series(mobility[date_mob_1], index=pd.date_range(date_mob_1, date_1, closed='right')))
+    mobility = mobility.sort_index()
 
     params_model = dict(new_cases_obs = new_cases,
-                    date_begin_data = date_data_begin,
-                    num_days_forecast = num_days_forecast,
+                    data_begin = date_begin,
+                    fcast_len = fcast_len,
                     diff_data_sim = diff_data_sim,
                     N_population = N) 
 
-    with cov19.Cov19_Model(**params_model) as model:
-        ts = mobility[date_data_begin:date_data_end].to_numpy().flatten()
-        ts = np.concatenate((ts,ts[-1]*np.ones(num_days_forecast)))
-        lambda_t_log = lambda_t_single(ts)
-        new_I_t = cov19.SIR(lambda_t_log, pr_median_mu=1/8)
+    with cov19.Cov19Model(**params_model) as model:
+
+        lambda_t_log = lambda_t_single(mobility.values)
+
+        new_I_t = cov19.SIR(lambda_t_log, pr_median_mu=1/8) 
+
+        return model
+
+
         new_cases_inferred_raw = cov19.delay_cases(new_I_t, pr_median_delay=10, 
                                                    pr_median_scale_delay=0.3)
         cov19.student_t_likelihood(new_cases_inferred_raw)
         trace = pm.sample(model=model, init='advi', tune=500, draws=500, cores=6)
+
     return trace, model
 
 def mobility_to_changepoints(mobility, lambda_0, lambda_min):
@@ -280,15 +295,39 @@ def get_mobility_reports_google(region, field_list, subregion=False):
 
 def lambda_t_single(ts):
 
-    cov19.Cov19_Model.get_context()
+    cov19.Cov19Model.get_context()
 
-    a = pm.Uniform(name='a', lower=0, upper=1)
-    b = pm.Uniform(name='b', lower=-1, upper=1)
+    lambda_0 = pm.Lognormal("lambda_0", mu=np.log(0.4), sigma=0.5)
+    lambda_coef = pm.Uniform(name='lambda_coef', lower=0, upper=1)
 
-    ts = tt._shared(ts.astype("float64"))
+    ts_tt = tt._shared(ts.astype("float64"))
 
-    lambda_t_log = tt.log(a*ts + b)
+    #lambda_t_log = tt.log(lambda_0*tt.ones(len(ts)) + a*ts_tt + b)
 
-    pm.Deterministic('lambda_t', a*ts + b)
+    lambda_t_log = tt.log(lambda_0*tt.ones(len(ts)) + lambda_coef*ts_tt)
+
+    pm.Deterministic("lambda_t", tt.exp(lambda_t_log))
 
     return lambda_t_log
+
+def lambda_t_all(mobility, factors):
+
+    names = {'retail_and_recreation_percent_change_from_baseline':'retail_and_recreation',
+            'grocery_and_pharmacy_percent_change_from_baseline':'grocery_and_pharmacy',
+            'parks_percent_change_from_baseline':'parks',
+            'transit_stations_percent_change_from_baseline':'transit_stations',
+            'workplaces_percent_change_from_baseline':'workplaces',
+            'residential_percent_change_from_baseline':'residential'
+            }
+
+    if len(factors) != 6:
+        ValueError('Need 6 factors')
+
+    mobility_norm = pd.DataFrame()
+
+    for key in mobility.keys():
+        mobility_norm[names[key]] = (100+mobility[key])/100
+
+    lambda_t = (mobility_norm*factors).sum(axis=1)
+
+    return lambda_t
