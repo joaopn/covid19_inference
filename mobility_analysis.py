@@ -177,12 +177,11 @@ def analyze_country(
 
     with cov19.Cov19Model(**params_model) as model:
 
+        mu = pm.Lognormal(name="mu", mu=np.log(1/8), sigma=0.2)
+
         lambda_t_log = lambda_t_single(mobility.values)
 
-        new_I_t = cov19.SIR(lambda_t_log, pr_median_mu=1/8) 
-
-        return model
-
+        new_I_t = cov19.SIR(lambda_t_log, mu)
 
         new_cases_inferred_raw = cov19.delay_cases(new_I_t, pr_median_delay=10, 
                                                    pr_median_scale_delay=0.3)
