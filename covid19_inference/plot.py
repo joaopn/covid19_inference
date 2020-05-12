@@ -2,7 +2,7 @@
 # @Author:        F. Paul Spitzner
 # @Email:         paul.spitzner@ds.mpg.de
 # @Created:       2020-04-20 18:50:13
-# @Last Modified: 2020-05-03 20:38:36
+# @Last Modified: 2020-05-06 18:00:03
 # ------------------------------------------------------------------------------ #
 # Callable in your scripts as e.g. `cov.plot.timeseries()`
 # Plot functions and helper classes
@@ -20,22 +20,381 @@ import copy
 
 import numpy as np
 import pandas as pd
+import pymc3 as pm
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from scipy import stats
 
 log = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------------------ #
-# Plotting functions
+# Time series plotting functions
 # ------------------------------------------------------------------------------ #
+
+
+def timeseries_overview(
+    model,
+    trace,
+    start=None,
+    end=None,
+    region=None,
+    color=None,
+    save_to=None,
+    offset=0,
+    annotate_constrained=True,
+    annotate_watermark=True,
+    axes=None,
+    forecast_label="Forecast",
+    add_more_later=False,
+):
+    """
+        Create the time series overview similar to our paper.
+        Dehning et al. arXiv:2004.01105
+        Contains $\lambda$, new cases, and cumulative cases.
+
+        Parameters
+        ----------
+        model : model instance
+
+        trace : trace instance
+            needed for the data
+
+        offset : int
+            offset that needs to be added to the (cumulative sum of) new cases at time
+            model.data_begin to arrive at cumulative cases
+
+        start : datetime.datetime
+            only used to set xrange in the end
+        end : datetime.datetime
+            only used to set xrange in the end
+        color : string
+            main color to use, default from rcParam
+        save_to : string or None
+            path where to save the figures. default: None, not saving figures
+        annotate_constrained : bool
+            show the unconstrained constrained annotation in lambda panel
+        annotate_watermark : bool
+            show our watermark
+        axes : np.array of mpl axes
+            provide an array of existing axes (from previously calling this function)
+            to add more traces. Data will not be added again. Ideally call this first
+            with `add_more_later=True`
+        forecast_label : string
+            legend label for the forecast, default: "Forecast"
+        add_more_later : bool
+            set this to true if you plan to add multiple models to the plot. changes the layout (and the color of the fit to past data)
+
+        Returns
+        -------
+            fig : mpl figure
+            axes : np array of mpl axeses (insets not included)
+
+        TODO
+        ----
+        * Replace `offset` with an instance of data class that should yield the
+          cumulative cases. we should not to calculations here.
+    """
+
+    figsize = (6, 6)
+    country = "Germany"
+    ylabel_new = f"Daily new reported\ncases in {country}"
+    # ylim_new = [0, 2_000]
+    # ylim_new_inset = [50, 17_000]
+
+    ylabel_cum = f"Total reported\ncases in {country}"
+    # ylim_cum = [0, 20_000]
+    # ylim_cum_inset = [50, 300_000]
+
+    ylabel_lam = f"Effective\ngrowth rate $\lambda^\\ast (t)$"
+    ylim_lam = [-0.15, 0.45]
+
+    letter_kwargs = dict(x=-0.25, y=1, size="x-large")
+
+    # per default we assume no hierarchical
+    if region is None:
+        region = ...
+
+    axes_provided = False
+    if axes is not None:
+        log.debug("Provided axes, adding new content")
+        axes_provided = True
+
+    color_data = rcParams.color_data
+    color_past = rcParams.color_model
+    color_fcast = rcParams.color_model
+    color_annot = rcParams.color_annot
+    if color is not None:
+        color_past = color
+        color_fcast = color
+
+    if axes_provided:
+        fig = axes[0].get_figure()
+    else:
+        fig, axes = plt.subplots(
+            3,
+            1,
+            figsize=figsize,
+            gridspec_kw={"height_ratios": [2, 3, 3]},
+            constrained_layout=True,
+        )
+        if add_more_later:
+            color_past = "#646464"
+
+    if start is None:
+        start = model.data_begin
+    if end is None:
+        end = model.sim_end
+
+    # insets are not reimplemented yet
+    insets = []
+    insets_only_two_ticks = True
+    draw_insets = False
+
+    # ------------------------------------------------------------------------------ #
+    # lambda*, effective growth rate
+    # ------------------------------------------------------------------------------ #
+    ax = axes[0]
+    mu = trace["mu"][:, None]
+    lambda_t, x = _get_array_from_trace_via_date(model, trace, "lambda_t")
+    y = lambda_t[:, :, region] - mu
+    _timeseries(x=x, y=y, ax=ax, what="model")
+    ax.set_ylabel(ylabel_lam)
+    ax.set_ylim(ylim_lam)
+
+    if not axes_provided:
+        ax.text(s="A", transform=ax.transAxes, **letter_kwargs)
+        ax.hlines(0, x[0], x[-1], linestyles=":")
+        if annotate_constrained:
+            try:
+                # depending on hierchy delay has differnt variable names.
+                # get the shortest one. todo: needs to be change depending on region.
+                delay_vars = [var for var in trace.varnames if "delay" in var]
+                delay_var = delay_vars.sort(key=len)[0]
+                delay = matplotlib.dates.date2num(model.data_end) - np.percentile(
+                    trace[delay_var], q=75
+                )
+                ax.vlines(delay, -10, 10, linestyles="-", colors=color_annot)
+                ax.text(
+                    delay + 1.5,
+                    0.4,
+                    "unconstrained due\nto reporting delay",
+                    color=color_annot,
+                    horizontalalignment="left",
+                    verticalalignment="top",
+                )
+                ax.text(
+                    delay - 1.5,
+                    0.4,
+                    "constrained\nby data",
+                    color=color_annot,
+                    horizontalalignment="right",
+                    verticalalignment="top",
+                )
+            except Exception as e:
+                log.debug(f"{e}")
+
+    # --------------------------------------------------------------------------- #
+    # New cases, lin scale first
+    # --------------------------------------------------------------------------- #
+    ax = axes[1]
+
+    y_past, x_past = _get_array_from_trace_via_date(
+        model, trace, "new_cases", model.data_begin, model.data_end
+    )
+    y_past = y_past[:, :, region]
+
+    y_data = model.new_cases_obs[:, region]
+
+    x_data = pd.date_range(start=model.data_begin, end=model.data_end)
+
+    # data points and annotations, draw only once
+    if not axes_provided:
+        ax.text(s="B", transform=ax.transAxes, **letter_kwargs)
+        _timeseries(
+            x=x_data,
+            y=y_data,
+            ax=ax,
+            what="data",
+            color=color_data,
+            zorder=5,
+            label="Data",
+        )
+        # model fit
+        _timeseries(
+            x=x_past, y=y_past, ax=ax, what="model", color=color_past, label="Fit",
+        )
+        if add_more_later:
+            # dummy element to separate forecasts
+            ax.plot(
+                [], [], "-", linewidth=0, label="Forecasts:",
+            )
+
+    # model fcast
+    y_fcast, x_fcast = _get_array_from_trace_via_date(
+        model, trace, "new_cases", model.fcast_begin, model.fcast_end
+    )
+    y_fcast = y_fcast[:, :, region]
+    _timeseries(
+        x=x_fcast,
+        y=y_fcast,
+        ax=ax,
+        what="fcast",
+        color=color_fcast,
+        label=f"{forecast_label}",
+    )
+    ax.set_ylabel(ylabel_new)
+    # ax.set_ylim(ylim_new)
+    prec = 1.0 / (np.log10(ax.get_ylim()[1]) - 2.5)
+    if prec < 2.0 and prec >= 0:
+        ax.yaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(_format_k(int(prec)))
+        )
+
+    # ------------------------------------------------------------------------------ #
+    # total cases, still needs work because its not in the trace, we cant plot it
+    # due to the lacking offset from new to cumulative cases, we cannot calculate
+    # either.
+    # ------------------------------------------------------------------------------ #
+
+    ax = axes[2]
+
+    y_past, x_past = _get_array_from_trace_via_date(
+        model, trace, "new_cases", model.data_begin, model.data_end
+    )
+    y_past = y_past[:, :, region]
+
+    y_data = model.new_cases_obs[:, region]
+    x_data = pd.date_range(start=model.data_begin, end=model.data_end)
+
+    x_data, y_data = _new_cases_to_cum_cases(x_data, y_data, "data", offset)
+    x_past, y_past = _new_cases_to_cum_cases(x_past, y_past, "trace", offset)
+
+    # data points and annotations, draw only once
+    if not axes_provided:
+        ax.text(s="C", transform=ax.transAxes, **letter_kwargs)
+        _timeseries(
+            x=x_data,
+            y=y_data,
+            ax=ax,
+            what="data",
+            color=color_data,
+            zorder=5,
+            label="Data",
+        )
+        # model fit
+        _timeseries(
+            x=x_past, y=y_past, ax=ax, what="model", color=color_past, label="Fit",
+        )
+        if add_more_later:
+            # dummy element to separate forecasts
+            ax.plot(
+                [], [], "-", linewidth=0, label="Forecasts:",
+            )
+
+    # model fcast, needs to start one day later, too. use the end date we got before
+    y_fcast, x_fcast = _get_array_from_trace_via_date(
+        model, trace, "new_cases", model.fcast_begin, model.fcast_end
+    )
+    y_fcast = y_fcast[:, :, region]
+
+    # offset according to last cumulative model point
+    x_fcast, y_fcast = _new_cases_to_cum_cases(
+        x_fcast, y_fcast, "trace", y_past[:, -1, None]
+    )
+
+    _timeseries(
+        x=x_fcast,
+        y=y_fcast,
+        ax=ax,
+        what="fcast",
+        color=color_fcast,
+        label=f"{forecast_label}",
+    )
+    ax.set_ylabel(ylabel_cum)
+    # ax.ylim(ylim_cum)
+    prec = 1.0 / (np.log10(ax.get_ylim()[1]) - 2.5)
+    if prec < 2.0 and prec >= 0:
+        ax.yaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(_format_k(int(prec)))
+        )
+
+    # --------------------------------------------------------------------------- #
+    # Finalize
+    # --------------------------------------------------------------------------- #
+
+    for ax in axes:
+        ax.set_rasterization_zorder(rcParams.rasterization_zorder)
+        ax.spines["right"].set_visible(False)
+        ax.spines["top"].set_visible(False)
+        ax.set_xlim(start, end)
+        _format_date_xticks(ax)
+
+        # biweekly, remove every second element
+        if not axes_provided:
+            for label in ax.xaxis.get_ticklabels()[1::2]:
+                label.set_visible(False)
+
+    for ax in insets:
+        ax.set_xlim(start, model.data_end)
+        ax.yaxis.tick_right()
+        ax.set_yscale("log")
+        if insets_only_two_ticks is True:
+            format_date_xticks(ax, minor=False)
+            for label in ax.xaxis.get_ticklabels()[1:-1]:
+                label.set_visible(False)
+            print(ax.xticks)
+        else:
+            format_date_xticks(ax)
+            for label in ax.xaxis.get_ticklabels()[1:-1]:
+                label.set_visible(False)
+
+    # legend
+    leg_loc = "upper left"
+    if draw_insets == True:
+        leg_loc = "upper right"
+    ax = axes[1]
+    ax.legend(loc=leg_loc)
+    ax.get_legend().get_frame().set_linewidth(0.0)
+    ax.get_legend().get_frame().set_facecolor("#F0F0F0")
+
+    if annotate_watermark:
+        _add_watermark(axes[1])
+
+    fig.suptitle(
+        # using script run time. could use last data point though.
+        f"Data until\n({model.data_end.strftime('%Y/%m/%d')})",
+        x=0.15,
+        y=1.075,
+        verticalalignment="top",
+        # fontsize="large",
+        fontweight="bold",
+        # loc="left",
+        # horizontalalignment="left",
+    )
+
+    # plt.subplots_adjust(wspace=0.4, hspace=0.25)
+    if save_to is not None:
+        plt.savefig(
+            save_to + ".pdf", dpi=300, bbox_inches="tight", pad_inches=0.05,
+        )
+        plt.savefig(
+            save_to + ".png", dpi=300, bbox_inches="tight", pad_inches=0.05,
+        )
+
+    # add insets to returned axes. maybe not, general axes style would be applied
+    # axes = np.append(axes, insets)
+
+    return fig, axes
 
 
 def _timeseries(x, y, ax=None, what="data", draw_ci_95=None, draw_ci_75=None, **kwargs):
     """
         low-level function to plot anything that has a date on the x-axis.
 
+        Parameters
+        ----------
         x : array of datetime.datetime
             times for the x axis
 
@@ -57,6 +416,9 @@ def _timeseries(x, y, ax=None, what="data", draw_ci_95=None, draw_ci_75=None, **
         kwargs : dict, optional
             directly passed to plotting mpl.
 
+        Returns
+        -------
+            ax
     """
 
     # ------------------------------------------------------------------------------ #
@@ -94,21 +456,23 @@ def _timeseries(x, y, ax=None, what="data", draw_ci_95=None, draw_ci_75=None, **
             kwargs = dict(kwargs, color=rcParams["color_data"])
         if "marker" not in kwargs:
             kwargs = dict(kwargs, marker="d")
+        if "ls" not in kwargs and "linestyle" not in kwargs:
+            kwargs = dict(kwargs, ls="None")
     elif what is "fcast":
         if "color" not in kwargs:
             kwargs = dict(kwargs, color=rcParams["color_model"])
-        if "ls" not in kwargs:
+        if "ls" not in kwargs and "linestyle" not in kwargs:
             kwargs = dict(kwargs, ls="--")
     elif what is "model":
         if "color" not in kwargs:
             kwargs = dict(kwargs, color=rcParams["color_model"])
-        if "ls" not in kwargs:
+        if "ls" not in kwargs and "linestyle" not in kwargs:
             kwargs = dict(kwargs, ls="-")
 
     # ------------------------------------------------------------------------------ #
     # plot
     # ------------------------------------------------------------------------------ #
-    ax.plot(x, data, label="Data", **kwargs)
+    ax.plot(x, data, **kwargs)
 
     # overwrite some styles that do not play well with fill_between
     if "linewidth" in kwargs:
@@ -117,6 +481,8 @@ def _timeseries(x, y, ax=None, what="data", draw_ci_95=None, draw_ci_75=None, **
         del kwargs["marker"]
     if "alpha" in kwargs:
         del kwargs["alpha"]
+    if "label" in kwargs:
+        del kwargs["label"]
     kwargs["lw"] = 0
     kwargs["alpha"] = 0.1
 
@@ -135,6 +501,11 @@ def _timeseries(x, y, ax=None, what="data", draw_ci_95=None, draw_ci_75=None, **
             np.percentile(y, q=87.5, axis=0),
             **kwargs,
         )
+
+    # ------------------------------------------------------------------------------ #
+    # formatting
+    # ------------------------------------------------------------------------------ #
+    _format_date_xticks(ax)
 
     return ax
 
@@ -164,12 +535,27 @@ def _get_array_from_trace_via_date(
 
         Returns
         -------
-        data : nd array
-            the elements from the trace matching the dates
+        data : nd array, 3 dim
+            the elements from the trace matching the dates.
+            dimensions are as follows
+                0 samples, if no samples only one entry
+                1 data with time matching the returned `dates` (if compatible variable)
+                2 region, if no regions only one entry
 
         dates : pandas DatetimeIndex
             the matching dates. this is essnetially an array of dates than can be passed
             to matplotlib
+
+        Example
+        -------
+        ```
+            import covid19_inference as cov
+            model, trace = cov.create_example_instance()
+            y, x = cov.plot._get_array_from_trace_via_date(
+                model, trace, "lambda_t", model.data_begin, model.data_end
+            )
+            ax = cov.plot._timeseries(x, y[:,:,0], what="model")
+        ```
     """
 
     ref = model.sim_begin
@@ -197,12 +583,206 @@ def _get_array_from_trace_via_date(
     )
     assert np.all(indices < model.sim_len), "all dates should be before model.sim_end"
 
-    # PS: I would really like to always have the 0 index present,
-    # even when no bundeslaender
-    if trace[var].ndim == 2:
-        return np.squeeze(trace[var][:, :, indices]), dates
+    # here we make sure that the returned array always has the same dimensions:
+    if trace[var].ndim == 3:
+        ret = trace[var][:, indices, :]
+    elif trace[var].ndim == 2:
+        ret = trace[var][:, indices]
+        # ret = trace[var][:, indices, None]
+        # 2020-05-06: jd and ps decided not to pad dimensions, not sure if it is more
+        # confusing to have changing dimensions or dimensions that are not needed
+        # in case of the non-hierarchical model
+        # to access the region if you are not sure if it exists use an ellipsis:
+        # region = ...
+        # trace[var][:, indices, region]
+        # will work fine if trace[var] is only 2-dimensional
+
+    return ret, dates
+
+
+def _new_cases_to_cum_cases(x, y, what, offset=0):
+    """
+        so this conversion got ugly really quickly.
+        need to check dimensionality of y
+
+        Parameters
+        ----------
+        x : pandas DatetimeIndex array
+            will be padded accordingly
+
+        y : 1d or 2d numpy array
+            new cases matching dates in x.
+            if 1d, we assume raw data (no samples)
+            if 2d, we assume results from trace with 0th dim samples and 1st new cases
+            matching x
+
+        what : str
+            dirty workaround to differntiate between traces and raw data
+            "data" or "trace"
+
+        offset : int or array like
+            added to cum sum (should be the known cumulative case number at the
+            first date of provided in x)
+
+        Returns
+        -------
+        x_cum : pandas DatetimeIndex array
+            dates of the cumulative cases
+
+        y_cum : nd array
+            cumulative cases matching x_cum and the dimension of input y
+
+        Example
+        -------
+        ```
+            cum_dates, cum_cases = _new_cases_to_cum_cases(new_dates, new_cases)
+        ```
+    """
+
+    # things from the trace have the 0-th dimension for samples. raw data does not
+    if what == "trace":
+        y_cum = np.cumsum(y, axis=1) + offset
+    elif what == "data":
+        y_cum = np.cumsum(y, axis=0) + offset
     else:
-        return np.squeeze(trace[var][:, indices]), dates
+        raise ValueError
+
+    # example with offset = 0:
+    # y_data new_cases [ 281  451  170 1597]
+    # y_data cum_cases [ 281  732  902 2499]
+
+    # so the cumulative used to be one day longer when applying the new cases to the
+    # next day, then add a date at the end of the x axis
+    # add one element using the existing frequency
+    # x_cum = x.union(pd.DatetimeIndex([x[-1] + 1 * x.freq]))
+    x_cum = x
+
+    return x_cum, y_cum
+
+
+# ------------------------------------------------------------------------------ #
+# Distribution plotting
+# ------------------------------------------------------------------------------ #
+
+
+def _distribution(model, trace, key, ax=None, color=None, draw_prior=True):
+
+    # check if model was hierarchical
+    # if model.is_hierarchical
+    # or like this
+    # is_hc = False
+    # for var in trace.varnames:
+    #     if re.fullmatch('lambda_[0-9]+_L[0-9]', var) is not None:
+    #         is_hc = True
+    #     break
+
+    # shape L2: samples, region, except sigma_L2 then no region
+    # shape L1: samples
+
+    if color is None:
+        color = rcParams.color_model
+
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
+
+    # todo: check compatible key before spending more time here
+    data = trace[key]
+
+    # apply additional transformations, if required
+    if "transient_day" in key:
+        # data = pd.to_datetime(data, origin=model.sim_begin, unit="D")
+        data = _days_to_mpl_dates(data, origin=model.sim_begin)
+    elif "weekend_factor_rad" == key:
+        data = data / np.pi / 2 * 7
+
+    ax.set_xlabel(_label_for_varname(key))
+    ax.xaxis.set_label_position("top")
+
+    # posteriors
+    ax.hist(
+        data,
+        bins=50,
+        density=True,
+        color=color,
+        label="Posterior",
+        alpha=0.7,
+        zorder=-5,
+    )
+
+    # xlim
+    if "lambda" in key or "mu" == key:
+        ax.set_xlim(0, 0.5)
+        ax.axvline(np.median(trace["mu"]), ls=":", color="black")
+    elif "I_begin" == key:
+        ax.set_xlim(0)
+    elif "transient_len" in key:
+        ax.set_xlim(0, 7)
+    elif "transient_day" in key:
+        md = np.median(data)
+        ax.set_xlim([int(md) - 4, int(md) + 4])
+        _format_date_xticks(ax)
+
+    if draw_prior:
+        # sample using pymc3. this avoids the headache of analytic solutions for
+        # combined variables when we do not have analytic priors
+        prior = pm.sample_prior_predictive(samples=500, model=model, var_names=[key])[
+            key
+        ]
+        # smooth density from discrete histogram
+        prior = stats.kde.gaussian_kde(prior)
+
+        # may need to convert axes values, and restore xlimits after adding prior
+        xlim = ax.get_xlim()
+        x_for_ax = np.linspace(*xlim, num=100)
+        x_for_pr = x_for_ax
+
+        if "transient_day" in key:
+            beg_x = matplotlib.dates.num2date(x_for_ax[0])
+            diff_dates_x = (beg_x.replace(tzinfo=None) - model.sim_begin).days
+            x_for_pr = x_for_ax - x_for_ax[0] + diff_dates_x
+        if "weekend_factor_rad" == key:
+            x_for_ax *= np.pi * 2 / 7
+
+        ax.plot(
+            x_for_ax,
+            prior(x_for_pr),
+            label="Prior",
+            color=rcParams.color_prior,
+            linewidth=3,
+        )
+        ax.set_xlim(*xlim)
+
+
+def _label_for_varname(key):
+    """
+        get the label for trace variable names
+    """
+    res = key
+
+    return res
+
+
+def _days_to_mpl_dates(days, origin):
+    """
+        convert days as number to matplotlib compatible date numbers.
+        this is not the same as pandas dateindices, but numpy operations work on them
+
+        Parameters
+        ----------
+        days : number, 1d array of numbers
+            the day number to convert
+
+        origin : datetime.datetime
+            the date object corresponding to day 0
+    """
+    try:
+        return matplotlib.dates.date2num(
+            [datetime.timedelta(days=float(date)) + origin for date in days]
+        )
+    except:
+        return matplotlib.dates.date2num(datetime.timedelta(days=float(days)) + origin)
 
 
 # ------------------------------------------------------------------------------ #
@@ -225,6 +805,7 @@ def get_rcparams_default():
         draw_ci_75=False,
         color_model="tab:green",
         color_data="tab:blue",
+        color_prior="#708090",
         color_annot="#646464",
     )
 
@@ -233,7 +814,8 @@ def get_rcparams_default():
 
 def set_rcparams(par):
     """
-        Set the rcparameters used for plotting. provided instance of `Param` has to have the following keys (attributes).
+        Set the rcparameters used for plotting. provided instance of `Param` has to have
+        the following keys (attributes).
 
         Attributes
         ----------
@@ -265,13 +847,17 @@ def set_rcparams(par):
             Base color used for model plots, mpl compatible color code "C0", "#303030"
             Default : "tab:green"
 
-       color_patalot : str,
+       color_data : str,
             Base color used for data
             Default : "tab:blue"
 
         color_annot : str,
             Color to use for annotations
             Default : "#646464"
+
+        color_prior : str,
+            Color to used for priors in distributions
+            Default : "#708090"
 
         Example
         ------
@@ -325,8 +911,18 @@ class Param(dict):
 # Formatting helpers
 # ------------------------------------------------------------------------------ #
 
-# format yaxis 10_000 as 10 k
-format_k = lambda num, _: "${:.0f}\,$k".format(num / 1_000)
+
+def _format_k(prec):
+    """
+        format yaxis 10_000 as 10 k.
+        _format_k(0)(1200, 1000.0) gives "1 k"
+        _format_k(1)(1200, 1000.0) gives "1.2 k"
+    """
+
+    def inner(xval, tickpos):
+        return f"${xval/1_000:.{prec}f}\,$k"
+
+    return inner
 
 
 def _format_date_xticks(ax, minor=None):
@@ -345,7 +941,7 @@ def _format_date_xticks(ax, minor=None):
     )
 
 
-def truncate_number(number, precision):
+def _truncate_number(number, precision):
     return "{{:.{}f}}".format(precision).format(number)
 
 
@@ -359,15 +955,24 @@ def print_median_CI(arr, prec=2):
     return "Median: {}\nCI: [{}, {}]".format(med, perc1, perc2)
 
 
-def conv_time_to_mpl_dates(arr):
-    try:
-        return matplotlib.dates.date2num(
-            [datetime.timedelta(days=float(date)) + date_begin_sim for date in arr]
-        )
-    except:
-        return matplotlib.dates.date2num(
-            datetime.timedelta(days=float(arr)) + date_begin_sim
-        )
+def _add_watermark(ax, mark="Dehning et al. arXiv:2004.01105"):
+    """
+        Add our arxive url to an axes as (upper right) title
+    """
+
+    # fig.text(
+    #     pos[0],
+    #     pos[1],
+    #     "Dehning et al.",
+    #     fontsize="medium",
+    #     transform=  fig.transFigure,
+    #     verticalalignment="top",
+    #     horizontalalignment="right",
+    #     color="#646464"
+    #     # bbox=dict(facecolor="white", alpha=0.5, edgecolor="none"),
+    # )
+
+    ax.set_title(mark, fontsize="small", loc="right", color="#646464")
 
 
 # ------------------------------------------------------------------------------ #
